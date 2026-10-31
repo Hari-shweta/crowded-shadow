@@ -10,6 +10,8 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <mutex>
+#include <condition_variable>
 
 struct Edge {
     uint32_t to;
@@ -70,29 +72,27 @@ public:
     }
 };
 
-// Ultra-fast persistent atomic generation barrier
 class SimpleBarrier {
 private:
-    const unsigned int count;
-    alignas(64) std::atomic<unsigned int> arrived{0};
-    alignas(64) std::atomic<unsigned int> generation{0};
+    std::mutex mtx;
+    std::condition_variable cv;
+    unsigned int count;
+    unsigned int initial;
+    unsigned int gen{0};
 public:
-    explicit SimpleBarrier(unsigned int num_threads) : count(num_threads) {}
+    explicit SimpleBarrier(unsigned int num_threads) : count(num_threads), initial(num_threads) {}
     inline void arrive_and_wait() {
-        unsigned int gen = generation.load(std::memory_order_acquire);
-        if (arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == count) {
-            arrived.store(0, std::memory_order_relaxed);
-            generation.store(gen + 1, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(mtx);
+        unsigned int g = gen;
+        if (--count == 0) {
+            gen++;
+            count = initial;
+            cv.notify_all();
         } else {
-            while (generation.load(std::memory_order_acquire) == gen) {
-#if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-#elif defined(__aarch64__)
-                asm volatile("yield" ::: "memory");
-#endif
-            }
+            cv.wait(lock, [this, g] { return gen != g; });
         }
     }
+    inline void wait() { arrive_and_wait(); }
 };
 
 static inline uint32_t fast_parse_u32(const char*& p) {

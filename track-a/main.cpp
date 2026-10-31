@@ -12,6 +12,7 @@
 #include <atomic>
 #include <algorithm>
 #include <mutex>
+#include <condition_variable>
 #include <cstdio>
 
 #if defined(__x86_64__)
@@ -66,22 +67,21 @@ static inline uint32_t hash_endpoint(const char* data, size_t len) {
 #endif
 
 struct SimpleBarrier {
-    std::atomic<int> count{0}, phase{0};
-    int total{0};
-    SimpleBarrier(int n) : total(n) {}
+    std::mutex mtx;
+    std::condition_variable cv;
+    unsigned int count;
+    unsigned int initial;
+    unsigned int gen{0};
+    explicit SimpleBarrier(unsigned int n) : count(n), initial(n) {}
     void wait() {
-        int p = phase.load(std::memory_order_relaxed);
-        if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == total) {
-            count.store(0, std::memory_order_relaxed);
-            phase.store(p + 1, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(mtx);
+        unsigned int g = gen;
+        if (--count == 0) {
+            gen++;
+            count = initial;
+            cv.notify_all();
         } else {
-            while (phase.load(std::memory_order_acquire) == p) {
-                #if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-                #elif defined(__aarch64__)
-                asm volatile("yield");
-                #endif
-            }
+            cv.wait(lock, [this, g] { return gen != g; });
         }
     }
 };

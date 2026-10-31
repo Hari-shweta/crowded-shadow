@@ -12,28 +12,29 @@
 #include <cstdio>
 #include <atomic>
 #include <unordered_map>
+#include <mutex>
+#include <condition_variable>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
 // Speed Demon 2026 - Track C: Join
 struct SimpleBarrier {
-    std::atomic<int> count{0}, phase{0};
-    int total{0};
-    SimpleBarrier(int n) : total(n) {}
+    std::mutex mtx;
+    std::condition_variable cv;
+    unsigned int count;
+    unsigned int initial;
+    unsigned int gen{0};
+    explicit SimpleBarrier(unsigned int n) : count(n), initial(n) {}
     void wait() {
-        int p = phase.load(std::memory_order_relaxed);
-        if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == total) {
-            count.store(0, std::memory_order_relaxed);
-            phase.store(p + 1, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(mtx);
+        unsigned int g = gen;
+        if (--count == 0) {
+            gen++;
+            count = initial;
+            cv.notify_all();
         } else {
-            while (phase.load(std::memory_order_acquire) == p) {
-                #if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-                #elif defined(__aarch64__)
-                asm volatile("yield");
-                #endif
-            }
+            cv.wait(lock, [this, g] { return gen != g; });
         }
     }
 };
@@ -376,11 +377,10 @@ int main(int argc, char** argv) {
     // 5. Output sorted country aggregates
     std::vector<uint8_t> sorted_cids(num_countries);
     for (size_t i = 0; i < num_countries; ++i) sorted_cids[i] = (uint8_t)i;
-    std::sort(sorted_cids.begin(), sorted_cids.end(), [&](uint8_t a, uint8_t b) {
-        return final_countries[a].name < final_countries[b].name;
-    });
+    std::sort(sorted_cids.begin(), sorted_cids.end(), [&](uint8_t a, uint8_t b) { return final_countries[a].name < final_countries[b].name; });
 
     FILE* out = fopen(out_path.c_str(), "w");
+    if (!out) out = fopen("aggregates.txt", "w");
     if (!out) return 1;
     std::vector<char> write_buf(1024 * 1024);
     setvbuf(out, write_buf.data(), _IOFBF, write_buf.size());
