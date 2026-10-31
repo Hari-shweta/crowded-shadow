@@ -10,12 +10,34 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
+#include <atomic>
 #include <unordered_map>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
 // Speed Demon 2026 - Track C: Join
+struct SimpleBarrier {
+    std::atomic<int> count{0}, phase{0};
+    int total{0};
+    SimpleBarrier(int n) : total(n) {}
+    void wait() {
+        int p = phase.load(std::memory_order_relaxed);
+        if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == total) {
+            count.store(0, std::memory_order_relaxed);
+            phase.store(p + 1, std::memory_order_release);
+        } else {
+            while (phase.load(std::memory_order_acquire) == p) {
+                #if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+                #elif defined(__aarch64__)
+                asm volatile("yield");
+                #endif
+            }
+        }
+    }
+};
+
 static inline size_t count_quotes(const char* ptr, size_t len) {
     size_t count = 0;
     const char* end = ptr + len;
@@ -35,8 +57,7 @@ static inline uint64_t hash64(const char* data, size_t len) {
     uint64_t h = len * 0x517cc1b727220a95ULL ^ 0x9e3779b97f4a7c15ULL;
     const uint8_t* p = (const uint8_t*)data;
     while (len >= 8) {
-        uint64_t k;
-        std::memcpy(&k, p, 8);
+        uint64_t k; std::memcpy(&k, p, 8);
         k = (k * 0xbf58476d1ce4e5b9ULL) ^ ((k * 0xbf58476d1ce4e5b9ULL) >> 31);
         h = ((h ^ (k * 0x94d049bb133111ebULL)) << 27) | ((h ^ (k * 0x94d049bb133111ebULL)) >> 37);
         p += 8; len -= 8;
@@ -112,7 +133,7 @@ int main(int argc, char** argv) {
         return id;
     };
 
-    static constexpr size_t DIRECT_TABLE_SIZE = 4194304;
+    static constexpr size_t DIRECT_TABLE_SIZE = 1048576; // 1MB direct table
     std::vector<uint8_t> region_to_country(DIRECT_TABLE_SIZE, 255);
     std::unordered_map<uint32_t, uint8_t> fallback_regions;
 
@@ -139,7 +160,7 @@ int main(int argc, char** argv) {
     dict[unmatched_cid].len = 10;
     size_t num_countries = num_dict;
 
-    // 2. Map records.csv & detect parallel boundaries
+    // 2. Map records.csv
     int rec_fd = open((data_dir + "/records.csv").c_str(), O_RDONLY);
     struct stat rec_sb; fstat(rec_fd, &rec_sb);
     const char* data = (const char*)mmap(nullptr, rec_sb.st_size, PROT_READ, MAP_PRIVATE, rec_fd, 0);
@@ -153,38 +174,9 @@ int main(int argc, char** argv) {
     size_t chunk_size = total_len / T;
 
     std::vector<size_t> q_counts(T, 0);
-    std::vector<std::thread> workers; workers.reserve(T);
-
-    for (int i = 0; i < T; ++i) {
-        workers.emplace_back([&, i]() {
-            const char* c_start = start + i * chunk_size;
-            size_t len = (i == T - 1) ? (end - c_start) : chunk_size;
-            q_counts[i] = count_quotes(c_start, len);
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
-
     std::vector<int> prefix_parity(T + 1, 0);
-    for (int i = 0; i < T; ++i) prefix_parity[i + 1] = (prefix_parity[i] + q_counts[i]) % 2;
-
     std::vector<const char*> boundaries(T + 1);
     boundaries[0] = start; boundaries[T] = end;
-
-    for (int i = 1; i < T; ++i) {
-        const char* ptr = start + i * chunk_size;
-        int p = prefix_parity[i];
-        while (ptr < end) {
-            if (*ptr == '"') p ^= 1;
-            else if (p == 0 && *ptr == '\n') {
-                ptr++;
-                if (ptr + 2 < end && (uint8_t)ptr[0] == 0xEF && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) ptr += 3;
-                boundaries[i] = ptr;
-                break;
-            }
-            ptr++;
-        }
-    }
 
     struct ThreadState {
         std::vector<ThreadAggregate> aggs;
@@ -197,10 +189,42 @@ int main(int argc, char** argv) {
         thread_states[i].offsets.resize(num_countries + 1, 0);
         thread_states[i].names.reserve(chunk_size / 40);
     }
+    std::vector<FinalCountry> final_countries(num_countries);
+    for (size_t i = 0; i < num_countries; ++i) final_countries[i].name = std::string(dict[i].name, dict[i].len);
 
-    // 3. Parallel worker records processing
+    SimpleBarrier barrier(T);
+    std::vector<std::thread> workers; workers.reserve(T);
+
     for (int t = 0; t < T; ++t) {
         workers.emplace_back([&, t]() {
+            // PHASE 1: SIMD quote counting
+            const char* c_start = start + t * chunk_size;
+            size_t len = (t == T - 1) ? (end - c_start) : chunk_size;
+            q_counts[t] = count_quotes(c_start, len);
+
+            barrier.wait();
+
+            // Thread 0 computes boundaries
+            if (t == 0) {
+                for (int i = 0; i < T; ++i) prefix_parity[i + 1] = (prefix_parity[i] + q_counts[i]) % 2;
+                for (int i = 1; i < T; ++i) {
+                    const char* ptr = start + i * chunk_size;
+                    int p = prefix_parity[i];
+                    while (ptr < end) {
+                        if (*ptr == '"') p ^= 1;
+                        else if (p == 0 && *ptr == '\n') {
+                            ptr++;
+                            if (ptr + 2 < end && (uint8_t)ptr[0] == 0xEF && (uint8_t)ptr[1] == 0xBB && (uint8_t)ptr[2] == 0xBF) ptr += 3;
+                            boundaries[i] = ptr;
+                            break;
+                        }
+                        ptr++;
+                    }
+                }
+            }
+            barrier.wait();
+
+            // PHASE 2: Parallel record parsing
             auto& state = thread_states[t];
             auto& aggs = state.aggs; auto& names = state.names;
             const char* ptr = boundaries[t], *c_end = boundaries[t + 1];
@@ -288,6 +312,11 @@ int main(int argc, char** argv) {
                 names.push_back(((uint64_t)cid << 56) | (nh & 0x00FFFFFFFFFFFFFFULL));
             }
 
+            // Immediately drop processed file pages to minimize RSS
+            #ifdef MADV_DONTNEED
+            madvise((void*)boundaries[t], (boundaries[t + 1] - boundaries[t]), MADV_DONTNEED);
+            #endif
+
             std::sort(names.begin(), names.end());
             size_t n_size = names.size(), cur_idx = 0;
             for (size_t c = 0; c < num_countries; ++c) {
@@ -295,32 +324,29 @@ int main(int argc, char** argv) {
                 while (cur_idx < n_size && (names[cur_idx] >> 56) == c) cur_idx++;
             }
             state.offsets[num_countries] = (uint32_t)n_size;
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
 
-    // 4. Combine scalars & parallel k-way merge of distinct names
-    std::vector<FinalCountry> final_countries(num_countries);
-    for (size_t i = 0; i < num_countries; ++i) final_countries[i].name = std::string(dict[i].name, dict[i].len);
+            barrier.wait();
 
-    for (int t = 0; t < T; ++t) {
-        for (size_t c = 0; c < num_countries; ++c) {
-            const auto& src = thread_states[t].aggs[c];
-            if (src.count == 0) continue;
-            auto& dst = final_countries[c];
-            if (dst.count == 0) { dst.amount_min = src.amount_min; dst.amount_max = src.amount_max; }
-            else {
-                if (src.amount_min < dst.amount_min) dst.amount_min = src.amount_min;
-                if (src.amount_max > dst.amount_max) dst.amount_max = src.amount_max;
+            // Thread 0 merges scalars
+            if (t == 0) {
+                for (int th = 0; th < T; ++th) {
+                    for (size_t c = 0; c < num_countries; ++c) {
+                        const auto& src = thread_states[th].aggs[c];
+                        if (src.count == 0) continue;
+                        auto& dst = final_countries[c];
+                        if (dst.count == 0) { dst.amount_min = src.amount_min; dst.amount_max = src.amount_max; }
+                        else {
+                            if (src.amount_min < dst.amount_min) dst.amount_min = src.amount_min;
+                            if (src.amount_max > dst.amount_max) dst.amount_max = src.amount_max;
+                        }
+                        dst.count += src.count; dst.id_sum += src.id_sum; dst.amount_sum += src.amount_sum;
+                        dst.name_bytes += src.name_bytes; dst.note_bytes += src.note_bytes;
+                    }
+                }
             }
-            dst.count += src.count; dst.id_sum += src.id_sum; dst.amount_sum += src.amount_sum;
-            dst.name_bytes += src.name_bytes; dst.note_bytes += src.note_bytes;
-        }
-    }
+            barrier.wait();
 
-    for (int t = 0; t < T; ++t) {
-        workers.emplace_back([&, t]() {
+            // PHASE 3: Parallel distinct names merge
             const uint64_t* ptrs[8]; const uint64_t* ends[8];
             for (size_t c = t; c < num_countries; c += T) {
                 int active_count = 0;
@@ -346,7 +372,6 @@ int main(int argc, char** argv) {
         });
     }
     for (auto& w : workers) w.join();
-    workers.clear();
 
     // 5. Output sorted country aggregates
     std::vector<uint8_t> sorted_cids(num_countries);
