@@ -13,33 +13,30 @@
 #include <cstdio>
 
 // Speed Demon 2026 - Track B: Index
-static bool IS_TOKEN_CHAR[256];
-static char TOKEN_LOWER[256];
-
+static uint8_t TOKEN_MAP[256];
 void init_token_tables() {
     for (int i = 0; i < 256; ++i) {
-        IS_TOKEN_CHAR[i] = (i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9');
-        TOKEN_LOWER[i] = (i >= 'A' && i <= 'Z') ? (char)(i + 32) : (char)i;
+        TOKEN_MAP[i] = (i >= 'a' && i <= 'z') ? (uint8_t)i :
+                       (i >= 'A' && i <= 'Z') ? (uint8_t)(i + 32) :
+                       (i >= '0' && i <= '9') ? (uint8_t)i : 0;
     }
 }
 
-static constexpr size_t VOCAB_CAPACITY = 1048576;
-struct VocabEntry {
-    const char* str = nullptr;
-    uint32_t len = 0, hash = 0;
-    int32_t id = -1;
-};
+static constexpr size_t VOCAB_CAPACITY = 1048576, BLOOM_SIZE = 4096;
+struct VocabEntry { const char* str = nullptr; uint32_t len = 0, hash = 0; int32_t id = -1; };
 
 class Vocabulary {
 public:
     std::vector<VocabEntry> table;
+    std::vector<uint64_t> bloom;
     uint32_t count = 0;
-    Vocabulary() : table(VOCAB_CAPACITY) {}
+    Vocabulary() : table(VOCAB_CAPACITY), bloom(BLOOM_SIZE, 0) {}
 
     int32_t get_or_insert(const char* data, uint32_t len) {
         uint64_t h = 14695981039346656037ULL;
         for (uint32_t i = 0; i < len; ++i) { h ^= (uint8_t)data[i]; h *= 1099511628211ULL; }
         uint32_t hash32 = (uint32_t)h;
+        bloom[(hash32 >> 6) & (BLOOM_SIZE - 1)] |= (1ULL << (hash32 & 63));
         size_t idx = h & (VOCAB_CAPACITY - 1);
         while (table[idx].str != nullptr) {
             if (table[idx].hash == hash32 && table[idx].len == len && memcmp(table[idx].str, data, len) == 0) return table[idx].id;
@@ -50,6 +47,7 @@ public:
     }
 
     int32_t lookup(const char* data, uint32_t len, uint32_t hash32) const {
+        if (!((bloom[(hash32 >> 6) & (BLOOM_SIZE - 1)] >> (hash32 & 63)) & 1ULL)) return -1;
         size_t idx = hash32 & (VOCAB_CAPACITY - 1);
         while (table[idx].str != nullptr) {
             if (table[idx].hash == hash32 && table[idx].len == len && memcmp(table[idx].str, data, len) == 0) return table[idx].id;
@@ -81,23 +79,23 @@ static inline void record_result(FormattedResult& r, uint32_t count, uint64_t su
 
 static inline bool token_match(const char* s, size_t len, const std::string& t) {
     if (len != t.size()) return false;
-    for (size_t i = 0; i < len; ++i) if (TOKEN_LOWER[(uint8_t)s[i]] != t[i]) return false;
+    for (size_t i = 0; i < len; ++i) if (TOKEN_MAP[(uint8_t)s[i]] != (uint8_t)t[i]) return false;
     return true;
 }
 static inline bool doc_contains_phrase(const char* ptr, const char* end, const std::vector<std::string>& terms) {
     size_t k = terms.size(); if (!k) return true;
     while (ptr < end) {
-        while (ptr < end && !IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+        while (ptr < end && !TOKEN_MAP[(uint8_t)*ptr]) ptr++;
         if (ptr >= end) break;
         const char* t_start = ptr;
-        while (ptr < end && IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+        while (ptr < end && TOKEN_MAP[(uint8_t)*ptr]) ptr++;
         if (token_match(t_start, ptr - t_start, terms[0])) {
             const char* sub = ptr; bool full = true;
             for (size_t m = 1; m < k; ++m) {
-                while (sub < end && !IS_TOKEN_CHAR[(uint8_t)*sub]) sub++;
+                while (sub < end && !TOKEN_MAP[(uint8_t)*sub]) sub++;
                 if (sub >= end) { full = false; break; }
                 const char* st = sub;
-                while (sub < end && IS_TOKEN_CHAR[(uint8_t)*sub]) sub++;
+                while (sub < end && TOKEN_MAP[(uint8_t)*sub]) sub++;
                 if (!token_match(st, sub - st, terms[m])) { full = false; break; }
             }
             if (full) return true;
@@ -159,7 +157,7 @@ int main(int argc, char** argv) {
                 while (p < line_end && *p != ' ' && *p != '\"') p++;
                 size_t t_len = p - t_start;
                 q.phrase_q.term_ids.push_back(vocab.get_or_insert(t_start, (uint32_t)t_len));
-                std::string raw(t_len, ' '); for (size_t i = 0; i < t_len; ++i) raw[i] = TOKEN_LOWER[(uint8_t)t_start[i]];
+                std::string raw(t_len, ' '); for (size_t i = 0; i < t_len; ++i) raw[i] = (char)TOKEN_MAP[(uint8_t)t_start[i]];
                 q.phrase_q.raw_terms.push_back(std::move(raw));
             }
         }
@@ -213,14 +211,16 @@ int main(int argc, char** argv) {
                 const char* end = ptr + docs[d].text_len;
                 if (!ptr) continue;
                 while (ptr < end) {
-                    while (ptr < end && !IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+                    while (ptr < end && !TOKEN_MAP[(uint8_t)*ptr]) ptr++;
                     if (ptr >= end) break;
                     char token[64]; uint32_t t_len = 0;
                     uint64_t h = 14695981039346656037ULL;
-                    while (ptr < end && IS_TOKEN_CHAR[(uint8_t)*ptr]) {
-                        char c = TOKEN_LOWER[(uint8_t)*ptr++];
-                        if (t_len < 64) token[t_len++] = c;
-                        h ^= (uint8_t)c; h *= 1099511628211ULL;
+                    while (ptr < end) {
+                        uint8_t c = TOKEN_MAP[(uint8_t)*ptr];
+                        if (!c) break;
+                        ptr++;
+                        if (t_len < 64) token[t_len++] = (char)c;
+                        h = (h ^ c) * 1099511628211ULL;
                     }
                     int32_t tid = vocab.lookup(token, t_len, (uint32_t)h);
                     if (tid >= 0 && last_seen[tid] != d) {
@@ -230,7 +230,6 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            std::sort(entries.begin(), entries.end());
         });
     }
     for (auto& w : workers) w.join();
