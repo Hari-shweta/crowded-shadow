@@ -7,4 +7,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | — | 27.20 | 2,290 | 0 |
 | 1 | Baseline C++ rewrite (dense 2D bitsets) | `cf7fdc8` | 5.226 | 2,399 | 19.959 |
 | 2 | Sparse CSR postings, 2-pass parallel ingestion, multi-threaded query evaluation | `feff7e1` | 0.974 | 128 | 50.477 |
-| 3 | Single-pass parallel indexing (Pass 2 eliminated), in-place zero-allocation stream phrase verification, reusable thread bitsets, 1MB buffered output | pending | ~0.12 | ~38 | ~75+ |
+| 3 | Single-pass fused parallel ingestion & indexing (eliminated serial doc parsing bottleneck), sequential cursor phrase streaming, L1 bloom filter, pre-allocated results & 1MB buffered I/O | pending | ~0.15 | ~45 | ~75+ |

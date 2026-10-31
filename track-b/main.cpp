@@ -170,24 +170,12 @@ int main(int argc, char** argv) {
     size_t d_size = d_st.st_size;
     const char* d_data = (const char*)mmap(nullptr, d_size, PROT_READ, MAP_PRIVATE, d_fd, 0);
 
-    std::vector<DocRef> docs; docs.reserve(262144);
-    const char* d_ptr = d_data, *d_end = d_data + d_size;
-    while (d_ptr < d_end) {
-        while (d_ptr < d_end && *d_ptr != '\t' && *d_ptr != '\n') d_ptr++;
-        if (d_ptr >= d_end) break;
-        if (*d_ptr == '\n') { docs.push_back({nullptr, 0}); d_ptr++; continue; }
-        d_ptr++;
-        const char* t_start = d_ptr;
-        while (d_ptr < d_end && *d_ptr != '\n') d_ptr++;
-        const char* t_end = d_ptr;
-        if (d_ptr < d_end && *d_ptr == '\n') d_ptr++;
-        docs.push_back({t_start, (uint32_t)(t_end - t_start)});
-    }
-    size_t num_docs = docs.size(), num_words = (num_docs + 63) / 64;
     unsigned int num_threads = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
-    size_t chunk_docs = (num_docs + num_threads - 1) / num_threads;
+    size_t max_docs = std::max((size_t)500000, (size_t)(d_size / 30));
+    std::vector<DocRef> docs(max_docs);
+    std::atomic<uint32_t> global_max_doc{0};
 
-    // SINGLE-PASS PARALLEL INDEXING (No Pass 2! No double tokenization!)
+    // SINGLE-PASS PARALLEL FUSED INGESTION & INDEXING
     struct ThreadIndex {
         std::vector<uint32_t> term_counts;
         std::vector<uint64_t> entries; // (tid << 32) | doc_id
@@ -195,45 +183,57 @@ int main(int argc, char** argv) {
     std::vector<ThreadIndex> thread_indexes(num_threads);
     for (unsigned int i = 0; i < num_threads; ++i) {
         thread_indexes[i].term_counts.resize(vocab.count, 0);
-        thread_indexes[i].entries.reserve(chunk_docs * 30);
+        thread_indexes[i].entries.reserve(262144);
     }
 
     std::vector<std::thread> workers;
     for (unsigned int i = 0; i < num_threads; ++i) {
-        size_t s = i * chunk_docs, e = std::min(s + chunk_docs, num_docs);
-        workers.emplace_back([&, i, s, e]() {
+        size_t b_start = i * (d_size / num_threads);
+        size_t b_end = (i == num_threads - 1) ? d_size : (i + 1) * (d_size / num_threads);
+        workers.emplace_back([&, i, b_start, b_end]() {
+            const char* ptr = d_data + b_start, *chunk_end = d_data + b_end;
+            if (i > 0 && d_data[b_start - 1] != '\n') {
+                while (ptr < d_data + d_size && *ptr != '\n') ptr++;
+                if (ptr < d_data + d_size && *ptr == '\n') ptr++;
+            }
             std::vector<uint32_t> last_seen(vocab.count, UINT32_MAX);
-            auto& counts = thread_indexes[i].term_counts;
-            auto& entries = thread_indexes[i].entries;
-
-            for (size_t d = s; d < e; ++d) {
-                const char* ptr = docs[d].text_start;
-                const char* end = ptr + docs[d].text_len;
-                if (!ptr) continue;
-                while (ptr < end) {
-                    while (ptr < end && !TOKEN_MAP[(uint8_t)*ptr]) ptr++;
-                    if (ptr >= end) break;
-                    char token[64]; uint32_t t_len = 0;
-                    uint64_t h = 14695981039346656037ULL;
-                    while (ptr < end) {
-                        uint8_t c = TOKEN_MAP[(uint8_t)*ptr];
-                        if (!c) break;
-                        ptr++;
-                        if (t_len < 64) token[t_len++] = (char)c;
+            auto& counts = thread_indexes[i].term_counts; auto& entries = thread_indexes[i].entries;
+            uint32_t local_max_doc = 0;
+            while (ptr < chunk_end) {
+                uint32_t d = 0;
+                while (ptr < d_data + d_size && *ptr >= '0' && *ptr <= '9') d = d * 10 + (*ptr++ - '0');
+                if (ptr < d_data + d_size && *ptr == '\t') ptr++;
+                const char* t_start = ptr;
+                while (ptr < d_data + d_size && *ptr != '\n') ptr++;
+                const char* t_end = ptr;
+                if (ptr < d_data + d_size && *ptr == '\n') ptr++;
+                if (d < docs.size()) docs[d] = {t_start, (uint32_t)(t_end - t_start)};
+                if (d > local_max_doc) local_max_doc = d;
+                const char* w_ptr = t_start;
+                while (w_ptr < t_end) {
+                    while (w_ptr < t_end && !TOKEN_MAP[(uint8_t)*w_ptr]) w_ptr++;
+                    if (w_ptr >= t_end) break;
+                    char token[64]; uint32_t t_len = 0; uint64_t h = 14695981039346656037ULL;
+                    while (w_ptr < t_end) {
+                        uint8_t c = TOKEN_MAP[(uint8_t)*w_ptr]; if (!c) break;
+                        w_ptr++; if (t_len < 64) token[t_len++] = (char)c;
                         h = (h ^ c) * 1099511628211ULL;
                     }
                     int32_t tid = vocab.lookup(token, t_len, (uint32_t)h);
                     if (tid >= 0 && last_seen[tid] != d) {
-                        last_seen[tid] = (uint32_t)d;
-                        counts[tid]++;
+                        last_seen[tid] = d; counts[tid]++;
                         entries.push_back(((uint64_t)tid << 32) | (uint32_t)d);
                     }
                 }
             }
+            uint32_t cur_max = global_max_doc.load(std::memory_order_relaxed);
+            while (local_max_doc > cur_max && !global_max_doc.compare_exchange_weak(cur_max, local_max_doc));
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
+
+    size_t num_docs = global_max_doc.load() + 1, num_words = (num_docs + 63) / 64;
 
     // CSR Head computation
     std::vector<uint32_t> head(vocab.count + 1, 0);
