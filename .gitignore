@@ -1,2 +1,7 @@
 .out/
 data/
+track-a/baseline
+track-a/milestone*
+*.o
+solution
+
