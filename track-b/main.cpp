@@ -1,133 +1,84 @@
 #include <iostream>
+#include <vector>
 #include <string>
-#include <chrono>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <cstdint>
 #include <cstring>
-#include <vector>
+#include <cstdint>
+#include <chrono>
+#include <thread>
+#include <atomic>
 #include <algorithm>
-#include <cstdio>
-#include <unordered_map>
 
-/**
- * SPEED DEMON 2026 - Track B: Index (Milestone 2 - Inverted Index & Query Engine)
- * 
- * 1. Parse queries.txt first -> collect query vocabulary (only terms that matter!).
- * 2. Flat open-addressing vocabulary hash table (maps term string -> term_id).
- * 3. Compact 64-bit document bitsets per term.
- * 4. Scan docs.txt -> only index tokens in query vocabulary.
- * 5. Boolean queries: Hardware-accelerated bitwise operations (&, |, & ~) + popcount / ctz.
- * 6. Phrase queries: Intersect term bitsets to get candidates, then verify exact token sequence.
- * 7. Results emitted directly into /out/results.txt in exact query order.
- */
-
-alignas(64) static uint8_t TOKEN_LOWER[256];
-alignas(64) static bool IS_TOKEN_CHAR[256];
+static bool IS_TOKEN_CHAR[256];
+static char TOKEN_LOWER[256];
 
 void init_token_tables() {
-    std::memset(TOKEN_LOWER, 0, sizeof(TOKEN_LOWER));
-    std::memset(IS_TOKEN_CHAR, 0, sizeof(IS_TOKEN_CHAR));
-
-    for (int c = '0'; c <= '9'; ++c) {
-        TOKEN_LOWER[c] = static_cast<uint8_t>(c);
-        IS_TOKEN_CHAR[c] = true;
-    }
-    for (int c = 'a'; c <= 'z'; ++c) {
-        TOKEN_LOWER[c] = static_cast<uint8_t>(c);
-        IS_TOKEN_CHAR[c] = true;
-    }
-    for (int c = 'A'; c <= 'Z'; ++c) {
-        TOKEN_LOWER[c] = static_cast<uint8_t>(c + 32);
-        IS_TOKEN_CHAR[c] = true;
+    for (int i = 0; i < 256; ++i) {
+        IS_TOKEN_CHAR[i] = (i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9');
+        if (i >= 'A' && i <= 'Z') TOKEN_LOWER[i] = (char)(i + 32);
+        else TOKEN_LOWER[i] = (char)i;
     }
 }
 
-struct StringView {
-    const char* data;
-    uint16_t len;
-
-    bool operator==(const StringView& other) const {
-        return len == other.len && std::memcmp(data, other.data, len) == 0;
-    }
-};
-
-inline uint64_t hash_term(const char* data, size_t len) {
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= static_cast<uint8_t>(data[i]);
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-// Fixed-capacity hash table for query vocabulary
+// Flat open-addressing vocabulary table for query terms
 static constexpr size_t VOCAB_CAPACITY = 131072;
-
 struct VocabEntry {
-    std::string str;
+    const char* str = nullptr;
+    uint32_t len = 0;
     int32_t id = -1;
-    bool occupied = false;
 };
 
 class Vocabulary {
 public:
     VocabEntry table[VOCAB_CAPACITY];
-    std::vector<std::string> terms;
+    uint32_t count = 0;
 
-    Vocabulary() {
-        terms.reserve(32768);
-    }
-
-    int32_t get_or_insert(const char* data, size_t len) {
-        uint64_t h = hash_term(data, len);
+    int32_t get_or_insert(const char* data, uint32_t len) {
+        uint64_t h = 14695981039346656037ULL;
+        for (uint32_t i = 0; i < len; ++i) {
+            h ^= (uint8_t)data[i];
+            h *= 1099511628211ULL;
+        }
         size_t idx = h & (VOCAB_CAPACITY - 1);
-
-        while (table[idx].occupied) {
-            if (table[idx].str.length() == len && std::memcmp(table[idx].str.data(), data, len) == 0) {
+        while (table[idx].str != nullptr) {
+            if (table[idx].len == len && memcmp(table[idx].str, data, len) == 0) {
                 return table[idx].id;
             }
             idx = (idx + 1) & (VOCAB_CAPACITY - 1);
         }
-
-        int32_t new_id = static_cast<int32_t>(terms.size());
-        table[idx].str.assign(data, len);
-        table[idx].id = new_id;
-        table[idx].occupied = true;
-        terms.emplace_back(data, len);
-        return new_id;
+        table[idx].str = data;
+        table[idx].len = len;
+        table[idx].id = count++;
+        return table[idx].id;
     }
 
-    int32_t lookup(const char* data, size_t len) const {
-        uint64_t h = hash_term(data, len);
+    int32_t lookup(const char* data, uint32_t len) const {
+        uint64_t h = 14695981039346656037ULL;
+        for (uint32_t i = 0; i < len; ++i) {
+            h ^= (uint8_t)data[i];
+            h *= 1099511628211ULL;
+        }
         size_t idx = h & (VOCAB_CAPACITY - 1);
-
-        while (table[idx].occupied) {
-            if (table[idx].str.length() == len && std::memcmp(table[idx].str.data(), data, len) == 0) {
+        while (table[idx].str != nullptr) {
+            if (table[idx].len == len && memcmp(table[idx].str, data, len) == 0) {
                 return table[idx].id;
             }
             idx = (idx + 1) & (VOCAB_CAPACITY - 1);
         }
         return -1;
     }
-
-    size_t size() const {
-        return terms.size();
-    }
 };
 
-enum class QueryType : uint8_t {
-    BOOL_QUERY,
-    PHRASE_QUERY
+struct DocRef {
+    const char* text_start = nullptr;
+    uint32_t text_len = 0;
 };
 
-enum class BoolOp : uint8_t {
-    AND,
-    OR,
-    NOT
-};
+enum class QueryType : uint8_t { BOOL_QUERY, PHRASE_QUERY };
+enum class BoolOp : uint8_t { AND, OR, NOT };
 
 struct BoolQuery {
     std::vector<int32_t> term_ids;
@@ -145,88 +96,47 @@ struct Query {
     PhraseQuery phrase_q;
 };
 
-struct DocRef {
-    const char* text_start = nullptr;
-    uint32_t text_len = 0;
-};
-
-struct MappedFile {
-    int fd = -1;
-    size_t size = 0;
-    const char* data = nullptr;
-
-    bool open_and_map(const std::string& path) {
-        fd = open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-
-        struct stat sb;
-        if (fstat(fd, &sb) < 0) {
-            close(fd);
-            return false;
-        }
-        size = sb.st_size;
-        if (size == 0) return true;
-
-        data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-        if (data == MAP_FAILED) {
-            close(fd);
-            return false;
-        }
-        #ifdef MADV_SEQUENTIAL
-        madvise((void*)data, size, MADV_SEQUENTIAL);
-        #endif
-        return true;
+static inline void append_u64(std::string& out, uint64_t val) {
+    if (val == 0) {
+        out.push_back('0');
+        return;
     }
-
-    void close_map() {
-        if (data && data != MAP_FAILED && size > 0) {
-            munmap((void*)data, size);
-        }
-        if (fd >= 0) close(fd);
+    char buf[24];
+    int p = 0;
+    while (val > 0) {
+        buf[p++] = '0' + (val % 10);
+        val /= 10;
     }
-
-    ~MappedFile() {
-        close_map();
-    }
-};
-
-std::string resolve_input_path(const std::string& data_dir, const std::string& filename) {
-    return data_dir + "/" + filename;
-}
-
-std::string resolve_output_path(const std::string& out_dir) {
-    struct stat s;
-    if (stat(out_dir.c_str(), &s) == 0 && S_ISDIR(s.st_mode)) {
-        return out_dir + "/results.txt";
-    }
-    return out_dir;
+    for (int i = p - 1; i >= 0; --i) out.push_back(buf[i]);
 }
 
 int main(int argc, char** argv) {
+    std::string data_dir = (argc > 1) ? argv[1] : "/data";
+    std::string out_path = (argc > 2) ? argv[2] : "/out/results.txt";
+    if (out_path.find(".txt") == std::string::npos) {
+        out_path += "/results.txt";
+    }
+
+    std::string docs_path = data_dir + "/docs.txt";
+    std::string queries_path = data_dir + "/queries.txt";
+
     init_token_tables();
 
-    std::string data_dir = (argc > 1) ? argv[1] : "/data";
-    std::string out_arg = (argc > 2) ? argv[2] : "/out/results.txt";
-    std::string out_path = resolve_output_path(out_arg);
-
-    std::string docs_path = resolve_input_path(data_dir, "docs.txt");
-    std::string queries_path = resolve_input_path(data_dir, "queries.txt");
-
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // 1. Map queries.txt and extract vocabulary
-    MappedFile queries_file;
-    if (!queries_file.open_and_map(queries_path)) {
-        std::cerr << "Error opening " << queries_path << std::endl;
-        return 1;
-    }
+    // 1. Memory-map queries.txt
+    int q_fd = open(queries_path.c_str(), O_RDONLY);
+    if (q_fd < 0) { perror("open queries"); return 1; }
+    struct stat q_st;
+    fstat(q_fd, &q_st);
+    size_t q_size = q_st.st_size;
+    const char* q_data = (const char*)mmap(nullptr, q_size, PROT_READ, MAP_PRIVATE, q_fd, 0);
+    close(q_fd);
 
     Vocabulary vocab;
     std::vector<Query> queries;
     queries.reserve(65536);
 
-    const char* q_ptr = queries_file.data;
-    const char* q_end = queries_file.data + queries_file.size;
+    const char* q_ptr = q_data;
+    const char* q_end = q_data + q_size;
 
     while (q_ptr < q_end) {
         const char* line_start = q_ptr;
@@ -239,68 +149,59 @@ int main(int argc, char** argv) {
 
         Query q;
         const char* p = line_start;
-
-        if (line_end - p >= 4 && std::memcmp(p, "BOOL", 4) == 0) {
+        if (line_end - p >= 4 && memcmp(p, "BOOL", 4) == 0) {
             q.type = QueryType::BOOL_QUERY;
             p += 4;
             if (p < line_end && *p == ' ') p++;
-
             while (p < line_end) {
                 const char* t_start = p;
                 while (p < line_end && *p != ' ') p++;
-                int32_t tid = vocab.get_or_insert(t_start, p - t_start);
-                q.bool_q.term_ids.push_back(tid);
-
-                if (p >= line_end) break;
-                p++; // skip space
-
-                if (line_end - p >= 3 && std::memcmp(p, "AND", 3) == 0) {
-                    q.bool_q.ops.push_back(BoolOp::AND);
-                    p += 3;
-                } else if (line_end - p >= 2 && std::memcmp(p, "OR", 2) == 0) {
-                    q.bool_q.ops.push_back(BoolOp::OR);
-                    p += 2;
-                } else if (line_end - p >= 3 && std::memcmp(p, "NOT", 3) == 0) {
-                    q.bool_q.ops.push_back(BoolOp::NOT);
-                    p += 3;
-                }
+                size_t t_len = p - t_start;
                 if (p < line_end && *p == ' ') p++;
+
+                if (t_len == 3 && memcmp(t_start, "AND", 3) == 0) {
+                    q.bool_q.ops.push_back(BoolOp::AND);
+                } else if (t_len == 2 && memcmp(t_start, "OR", 2) == 0) {
+                    q.bool_q.ops.push_back(BoolOp::OR);
+                } else if (t_len == 3 && memcmp(t_start, "NOT", 3) == 0) {
+                    q.bool_q.ops.push_back(BoolOp::NOT);
+                } else {
+                    int32_t tid = vocab.get_or_insert(t_start, (uint32_t)t_len);
+                    q.bool_q.term_ids.push_back(tid);
+                }
             }
-        } else if (line_end - p >= 6 && std::memcmp(p, "PHRASE", 6) == 0) {
+        } else if (line_end - p >= 6 && memcmp(p, "PHRASE", 6) == 0) {
             q.type = QueryType::PHRASE_QUERY;
             p += 6;
-            while (p < line_end && *p != '"') p++;
-            if (p < line_end && *p == '"') p++;
-
-            while (p < line_end && *p != '"') {
+            while (p < line_end && *p != '\"') p++;
+            if (p < line_end && *p == '\"') p++;
+            while (p < line_end && *p != '\"') {
                 while (p < line_end && *p == ' ') p++;
-                if (p >= line_end || *p == '"') break;
-
+                if (p >= line_end || *p == '\"') break;
                 const char* t_start = p;
-                while (p < line_end && *p != ' ' && *p != '"') p++;
-                int32_t tid = vocab.get_or_insert(t_start, p - t_start);
+                while (p < line_end && *p != ' ' && *p != '\"') p++;
+                size_t t_len = p - t_start;
+                int32_t tid = vocab.get_or_insert(t_start, (uint32_t)t_len);
                 q.phrase_q.term_ids.push_back(tid);
-                q.phrase_q.raw_terms.emplace_back(t_start, p - t_start);
+                q.phrase_q.raw_terms.emplace_back(t_start, t_len);
             }
         }
         queries.push_back(std::move(q));
     }
 
-    size_t num_terms = vocab.size();
-
-    // 2. Map docs.txt and count documents
-    MappedFile docs_file;
-    if (!docs_file.open_and_map(docs_path)) {
-        std::cerr << "Error opening " << docs_path << std::endl;
-        return 1;
-    }
+    // 2. Memory-map docs.txt
+    int d_fd = open(docs_path.c_str(), O_RDONLY);
+    if (d_fd < 0) { perror("open docs"); return 1; }
+    struct stat d_st;
+    fstat(d_fd, &d_st);
+    size_t d_size = d_st.st_size;
+    const char* d_data = (const char*)mmap(nullptr, d_size, PROT_READ, MAP_PRIVATE, d_fd, 0);
+    close(d_fd);
 
     std::vector<DocRef> docs;
     docs.reserve(262144);
-
-    const char* d_ptr = docs_file.data;
-    const char* d_end = docs_file.data + docs_file.size;
-
+    const char* d_ptr = d_data;
+    const char* d_end = d_data + d_size;
     while (d_ptr < d_end) {
         while (d_ptr < d_end && *d_ptr != '\t' && *d_ptr != '\n') d_ptr++;
         if (d_ptr >= d_end) break;
@@ -309,226 +210,320 @@ int main(int argc, char** argv) {
             d_ptr++;
             continue;
         }
-        d_ptr++; // skip '\t'
-
-        const char* text_start = d_ptr;
+        d_ptr++; // skip tab
+        const char* t_start = d_ptr;
         while (d_ptr < d_end && *d_ptr != '\n') d_ptr++;
-        const char* text_end = d_ptr;
+        const char* t_end = d_ptr;
         if (d_ptr < d_end && *d_ptr == '\n') d_ptr++;
-
-        docs.push_back({text_start, static_cast<uint32_t>(text_end - text_start)});
+        docs.push_back({t_start, (uint32_t)(t_end - t_start)});
     }
-
     size_t num_docs = docs.size();
     size_t num_words = (num_docs + 63) / 64;
 
-    // 3. Allocate bitset inverted index: num_terms x num_words
-    // Each term gets a flat bitset of length num_words uint64_t
-    std::vector<uint64_t> postings(num_terms * num_words, 0);
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
 
-    // Ingest corpus: tokenize and set bits for terms in vocabulary
-    char token_buf[64];
+    // PASS 1: Count DF per term across threads (Zero dynamic allocations!)
+    std::vector<std::vector<uint32_t>> thread_df(num_threads, std::vector<uint32_t>(vocab.count, 0));
+    std::vector<std::thread> workers;
+    size_t chunk_docs = (num_docs + num_threads - 1) / num_threads;
 
-    for (uint32_t doc_id = 0; doc_id < num_docs; ++doc_id) {
-        const char* ptr = docs[doc_id].text_start;
-        const char* end = ptr + docs[doc_id].text_len;
-        if (!ptr) continue;
+    auto pass1_worker = [&](unsigned int tid_worker, size_t start_doc, size_t end_doc) {
+        std::vector<uint32_t> last_seen(vocab.count, UINT32_MAX);
+        auto& my_df = thread_df[tid_worker];
+        for (size_t d = start_doc; d < end_doc; ++d) {
+            const char* ptr = docs[d].text_start;
+            const char* end = ptr + docs[d].text_len;
+            if (!ptr) continue;
 
-        size_t word_idx = doc_id / 64;
-        uint64_t bit_mask = 1ULL << (doc_id % 64);
-
-        while (ptr < end) {
-            while (ptr < end && !IS_TOKEN_CHAR[static_cast<uint8_t>(*ptr)]) {
-                ptr++;
-            }
-            if (ptr >= end) break;
-
-            size_t t_len = 0;
-            while (ptr < end && IS_TOKEN_CHAR[static_cast<uint8_t>(*ptr)]) {
-                if (t_len < sizeof(token_buf)) {
-                    token_buf[t_len++] = TOKEN_LOWER[static_cast<uint8_t>(*ptr)];
+            while (ptr < end) {
+                while (ptr < end && !IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+                if (ptr >= end) break;
+                char token[64];
+                uint32_t t_len = 0;
+                while (ptr < end && IS_TOKEN_CHAR[(uint8_t)*ptr]) {
+                    if (t_len < 64) token[t_len++] = TOKEN_LOWER[(uint8_t)*ptr];
+                    ptr++;
                 }
-                ptr++;
-            }
-
-            int32_t tid = vocab.lookup(token_buf, t_len);
-            if (tid >= 0) {
-                postings[static_cast<size_t>(tid) * num_words + word_idx] |= bit_mask;
+                int32_t tid = vocab.lookup(token, t_len);
+                if (tid >= 0 && last_seen[tid] != d) {
+                    last_seen[tid] = (uint32_t)d;
+                    my_df[tid]++;
+                }
             }
         }
+    };
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        size_t s = i * chunk_docs;
+        size_t e = std::min(s + chunk_docs, num_docs);
+        workers.emplace_back(pass1_worker, i, s, e);
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    // Compute CSR offsets
+    std::vector<uint32_t> head(vocab.count + 1, 0);
+    for (uint32_t t = 0; t < vocab.count; ++t) {
+        uint32_t total_t = 0;
+        for (unsigned int th = 0; th < num_threads; ++th) total_t += thread_df[th][t];
+        head[t + 1] = head[t] + total_t;
     }
 
-    // 4. Answer all queries
-    FILE* out = fopen(out_path.c_str(), "w");
-    if (!out) {
-        std::cerr << "Error opening " << out_path << std::endl;
-        return 1;
+    uint32_t total_postings = head[vocab.count];
+    std::vector<uint32_t> flat_postings(total_postings);
+
+    // Thread write cursors for parallel pass 2
+    std::vector<std::vector<uint32_t>> thread_cur(num_threads, std::vector<uint32_t>(vocab.count, 0));
+    for (uint32_t t = 0; t < vocab.count; ++t) {
+        uint32_t pos = head[t];
+        for (unsigned int th = 0; th < num_threads; ++th) {
+            thread_cur[th][t] = pos;
+            pos += thread_df[th][t];
+        }
     }
+    thread_df.clear();
 
-    std::vector<char> write_buf(1024 * 1024);
-    setvbuf(out, write_buf.data(), _IOFBF, write_buf.size());
+    // PASS 2: Write doc IDs directly into contiguous flat_postings
+    auto pass2_worker = [&](unsigned int tid_worker, size_t start_doc, size_t end_doc) {
+        std::vector<uint32_t> last_seen(vocab.count, UINT32_MAX);
+        auto& my_cur = thread_cur[tid_worker];
+        for (size_t d = start_doc; d < end_doc; ++d) {
+            const char* ptr = docs[d].text_start;
+            const char* end = ptr + docs[d].text_len;
+            if (!ptr) continue;
 
-    std::vector<uint64_t> running_set(num_words);
-    std::vector<std::string> doc_tokens;
-    doc_tokens.reserve(1024);
-
-    for (const auto& q : queries) {
-        if (q.type == QueryType::BOOL_QUERY) {
-            const auto& terms = q.bool_q.term_ids;
-            const auto& ops = q.bool_q.ops;
-
-            if (terms.empty()) {
-                std::fputs("0 0\n", out);
-                continue;
+            while (ptr < end) {
+                while (ptr < end && !IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+                if (ptr >= end) break;
+                char token[64];
+                uint32_t t_len = 0;
+                while (ptr < end && IS_TOKEN_CHAR[(uint8_t)*ptr]) {
+                    if (t_len < 64) token[t_len++] = TOKEN_LOWER[(uint8_t)*ptr];
+                    ptr++;
+                }
+                int32_t tid = vocab.lookup(token, t_len);
+                if (tid >= 0 && last_seen[tid] != d) {
+                    last_seen[tid] = (uint32_t)d;
+                    flat_postings[my_cur[tid]++] = (uint32_t)d;
+                }
             }
+        }
+    };
 
-            // Initialize running_set with first term
-            int32_t t0 = terms[0];
-            const uint64_t* t0_bits = (t0 >= 0) ? &postings[static_cast<size_t>(t0) * num_words] : nullptr;
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        size_t s = i * chunk_docs;
+        size_t e = std::min(s + chunk_docs, num_docs);
+        workers.emplace_back(pass2_worker, i, s, e);
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+    thread_cur.clear();
 
-            if (t0_bits) {
-                std::memcpy(running_set.data(), t0_bits, num_words * sizeof(uint64_t));
-            } else {
-                std::memset(running_set.data(), 0, num_words * sizeof(uint64_t));
-            }
+    // 3. Multi-threaded Query Answering with Fast Output Buffer
+    std::vector<std::string> query_results(queries.size());
+    std::atomic<size_t> next_query{0};
 
-            // Apply operations strictly left-to-right
-            for (size_t i = 0; i < ops.size(); ++i) {
-                BoolOp op = ops[i];
-                int32_t ti = terms[i + 1];
-                const uint64_t* ti_bits = (ti >= 0) ? &postings[static_cast<size_t>(ti) * num_words] : nullptr;
+    auto query_worker = [&]() {
+        std::vector<uint64_t> running(num_words, 0);
+        std::vector<uint32_t> surviving;
+        surviving.reserve(4096);
+        std::vector<std::string> doc_tokens;
+        doc_tokens.reserve(1024);
 
-                if (op == BoolOp::AND) {
-                    if (ti_bits) {
-                        for (size_t w = 0; w < num_words; ++w) {
-                            running_set[w] &= ti_bits[w];
+        while (true) {
+            size_t qi = next_query.fetch_add(1, std::memory_order_relaxed);
+            if (qi >= queries.size()) break;
+
+            const auto& q = queries[qi];
+            if (q.type == QueryType::BOOL_QUERY) {
+                const auto& terms = q.bool_q.term_ids;
+                const auto& ops = q.bool_q.ops;
+
+                if (terms.empty()) {
+                    query_results[qi] = "0 0\n";
+                    continue;
+                }
+
+                // Initialize running with first term
+                memset(running.data(), 0, num_words * sizeof(uint64_t));
+                int32_t t0 = terms[0];
+                if (t0 >= 0) {
+                    uint32_t s0 = head[t0];
+                    uint32_t e0 = head[t0 + 1];
+                    for (uint32_t i = s0; i < e0; ++i) {
+                        uint32_t d = flat_postings[i];
+                        running[d >> 6] |= (1ULL << (d & 63));
+                    }
+                }
+
+                // Apply operations left-to-right
+                for (size_t op_i = 0; op_i < ops.size(); ++op_i) {
+                    BoolOp op = ops[op_i];
+                    int32_t ti = terms[op_i + 1];
+
+                    if (ti < 0 || head[ti] == head[ti + 1]) {
+                        if (op == BoolOp::AND) {
+                            memset(running.data(), 0, num_words * sizeof(uint64_t));
                         }
-                    } else {
-                        std::memset(running_set.data(), 0, num_words * sizeof(uint64_t));
+                        continue;
                     }
-                } else if (op == BoolOp::OR) {
-                    if (ti_bits) {
-                        for (size_t w = 0; w < num_words; ++w) {
-                            running_set[w] |= ti_bits[w];
+
+                    uint32_t si = head[ti];
+                    uint32_t ei = head[ti + 1];
+                    uint32_t term_df = ei - si;
+
+                    if (op == BoolOp::OR) {
+                        for (uint32_t i = si; i < ei; ++i) {
+                            uint32_t d = flat_postings[i];
+                            running[d >> 6] |= (1ULL << (d & 63));
                         }
-                    }
-                } else if (op == BoolOp::NOT) {
-                    if (ti_bits) {
-                        for (size_t w = 0; w < num_words; ++w) {
-                            running_set[w] &= ~ti_bits[w];
+                    } else if (op == BoolOp::NOT) {
+                        for (uint32_t i = si; i < ei; ++i) {
+                            uint32_t d = flat_postings[i];
+                            running[d >> 6] &= ~(1ULL << (d & 63));
                         }
-                    }
-                }
-            }
-
-            // Extract count, sum, first 10 IDs
-            uint32_t count = 0;
-            uint64_t sum = 0;
-            uint32_t first10[10];
-            uint32_t num_first10 = 0;
-
-            for (size_t w = 0; w < num_words; ++w) {
-                uint64_t word = running_set[w];
-                if (word == 0) continue;
-                count += __builtin_popcountll(word);
-
-                uint32_t base_id = static_cast<uint32_t>(w * 64);
-                while (word != 0) {
-                    int ctz = __builtin_ctzll(word);
-                    uint32_t doc_id = base_id + static_cast<uint32_t>(ctz);
-                    sum += doc_id;
-                    if (num_first10 < 10) {
-                        first10[num_first10++] = doc_id;
-                    }
-                    word &= word - 1;
-                }
-            }
-
-            if (count == 0) {
-                std::fputs("0 0\n", out);
-            } else {
-                std::fprintf(out, "%u %llu", count, static_cast<unsigned long long>(sum));
-                for (uint32_t j = 0; j < num_first10; ++j) {
-                    std::fprintf(out, " %u", first10[j]);
-                }
-                std::fputc('\n', out);
-            }
-        } else {
-            // PHRASE query
-            const auto& term_ids = q.phrase_q.term_ids;
-            const auto& raw_terms = q.phrase_q.raw_terms;
-            size_t k = raw_terms.size();
-
-            bool impossible = false;
-            for (int32_t tid : term_ids) {
-                if (tid < 0) {
-                    impossible = true;
-                    break;
-                }
-            }
-
-            if (impossible || k == 0) {
-                std::fputs("0 0\n", out);
-                continue;
-            }
-
-            // Intersect all phrase terms to get candidates
-            const uint64_t* t0_bits = &postings[static_cast<size_t>(term_ids[0]) * num_words];
-            std::memcpy(running_set.data(), t0_bits, num_words * sizeof(uint64_t));
-
-            for (size_t i = 1; i < k; ++i) {
-                const uint64_t* ti_bits = &postings[static_cast<size_t>(term_ids[i]) * num_words];
-                for (size_t w = 0; w < num_words; ++w) {
-                    running_set[w] &= ti_bits[w];
-                }
-            }
-
-            // Verify candidates by scanning document token sequence
-            uint32_t count = 0;
-            uint64_t sum = 0;
-            uint32_t first10[10];
-            uint32_t num_first10 = 0;
-
-            for (size_t w = 0; w < num_words; ++w) {
-                uint64_t word = running_set[w];
-                if (word == 0) continue;
-
-                uint32_t base_id = static_cast<uint32_t>(w * 64);
-                while (word != 0) {
-                    int ctz = __builtin_ctzll(word);
-                    uint32_t doc_id = base_id + static_cast<uint32_t>(ctz);
-
-                    // Scan doc_id for exact consecutive tokens
-                    const char* p = docs[doc_id].text_start;
-                    const char* p_end = p + docs[doc_id].text_len;
-
-                    doc_tokens.clear();
-                    while (p < p_end) {
-                        while (p < p_end && !IS_TOKEN_CHAR[static_cast<uint8_t>(*p)]) p++;
-                        if (p >= p_end) break;
-
-                        size_t t_len = 0;
-                        while (p < p_end && IS_TOKEN_CHAR[static_cast<uint8_t>(*p)]) {
-                            if (t_len < sizeof(token_buf)) {
-                                token_buf[t_len++] = TOKEN_LOWER[static_cast<uint8_t>(*p)];
+                    } else if (op == BoolOp::AND) {
+                        if (term_df < 1000) {
+                            surviving.clear();
+                            for (uint32_t i = si; i < ei; ++i) {
+                                uint32_t d = flat_postings[i];
+                                if ((running[d >> 6] >> (d & 63)) & 1ULL) {
+                                    surviving.push_back(d);
+                                }
                             }
-                            p++;
+                            memset(running.data(), 0, num_words * sizeof(uint64_t));
+                            for (uint32_t d : surviving) {
+                                running[d >> 6] |= (1ULL << (d & 63));
+                            }
+                        } else {
+                            std::vector<uint64_t> term_bits(num_words, 0);
+                            for (uint32_t i = si; i < ei; ++i) {
+                                uint32_t d = flat_postings[i];
+                                term_bits[d >> 6] |= (1ULL << (d & 63));
+                            }
+                            for (size_t w = 0; w < num_words; ++w) {
+                                running[w] &= term_bits[w];
+                            }
                         }
-                        doc_tokens.emplace_back(token_buf, t_len);
+                    }
+                }
+
+                // Format count, sum, first 10
+                uint32_t count = 0;
+                uint64_t sum = 0;
+                uint32_t first10[10];
+                uint32_t num_first10 = 0;
+
+                for (size_t w = 0; w < num_words; ++w) {
+                    uint64_t word = running[w];
+                    if (!word) continue;
+                    count += __builtin_popcountll(word);
+                    uint32_t base = w * 64;
+                    while (word) {
+                        int ctz = __builtin_ctzll(word);
+                        uint32_t d = base + ctz;
+                        sum += d;
+                        if (num_first10 < 10) first10[num_first10++] = d;
+                        word &= word - 1;
+                    }
+                }
+
+                if (count == 0) {
+                    query_results[qi] = "0 0\n";
+                } else {
+                    std::string res;
+                    res.reserve(64);
+                    append_u64(res, count);
+                    res.push_back(' ');
+                    append_u64(res, sum);
+                    for (uint32_t i = 0; i < num_first10; ++i) {
+                        res.push_back(' ');
+                        append_u64(res, first10[i]);
+                    }
+                    res.push_back('\n');
+                    query_results[qi] = std::move(res);
+                }
+
+            } else {
+                // PHRASE QUERY
+                const auto& phrase_terms = q.phrase_q.term_ids;
+                const auto& raw_terms = q.phrase_q.raw_terms;
+                size_t phrase_len = phrase_terms.size();
+
+                bool possible = true;
+                for (int32_t tid : phrase_terms) {
+                    if (tid < 0 || head[tid] == head[tid + 1]) {
+                        possible = false;
+                        break;
+                    }
+                }
+
+                if (!possible) {
+                    query_results[qi] = "0 0\n";
+                    continue;
+                }
+
+                // Find anchor with min DF
+                int32_t min_tid = phrase_terms[0];
+                uint32_t min_df = head[min_tid + 1] - head[min_tid];
+                for (size_t i = 1; i < phrase_len; ++i) {
+                    int32_t tid = phrase_terms[i];
+                    uint32_t df_i = head[tid + 1] - head[tid];
+                    if (df_i < min_df) {
+                        min_df = df_i;
+                        min_tid = tid;
+                    }
+                }
+
+                uint32_t s_min = head[min_tid];
+                uint32_t e_min = head[min_tid + 1];
+
+                uint32_t count = 0;
+                uint64_t sum = 0;
+                uint32_t first10[10];
+                uint32_t num_first10 = 0;
+
+                for (uint32_t i = s_min; i < e_min; ++i) {
+                    uint32_t d = flat_postings[i];
+                    bool doc_has_all = true;
+                    for (size_t t = 0; t < phrase_len; ++t) {
+                        int32_t tid = phrase_terms[t];
+                        if (tid == min_tid) continue;
+                        auto start_it = flat_postings.begin() + head[tid];
+                        auto end_it = flat_postings.begin() + head[tid + 1];
+                        if (!std::binary_search(start_it, end_it, d)) {
+                            doc_has_all = false;
+                            break;
+                        }
+                    }
+                    if (!doc_has_all) continue;
+
+                    // Verify exact sequence in document
+                    const char* ptr = docs[d].text_start;
+                    const char* end = ptr + docs[d].text_len;
+                    doc_tokens.clear();
+                    while (ptr < end) {
+                        while (ptr < end && !IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+                        if (ptr >= end) break;
+                        const char* ts = ptr;
+                        while (ptr < end && IS_TOKEN_CHAR[(uint8_t)*ptr]) ptr++;
+                        doc_tokens.emplace_back(ts, ptr - ts);
                     }
 
-                    // Check for consecutive match
                     bool matched = false;
-                    if (doc_tokens.size() >= k) {
-                        for (size_t i = 0; i <= doc_tokens.size() - k; ++i) {
-                            bool seq_ok = true;
-                            for (size_t m = 0; m < k; ++m) {
-                                if (doc_tokens[i + m] != raw_terms[m]) {
-                                    seq_ok = false;
+                    if (doc_tokens.size() >= phrase_len) {
+                        for (size_t pos = 0; pos <= doc_tokens.size() - phrase_len; ++pos) {
+                            bool match_here = true;
+                            for (size_t k = 0; k < phrase_len; ++k) {
+                                const std::string& dt = doc_tokens[pos + k];
+                                const std::string& pt = raw_terms[k];
+                                if (dt.length() != pt.length() || strncasecmp(dt.data(), pt.data(), dt.length()) != 0) {
+                                    match_here = false;
                                     break;
                                 }
                             }
-                            if (seq_ok) {
+                            if (match_here) {
                                 matched = true;
                                 break;
                             }
@@ -537,40 +532,46 @@ int main(int argc, char** argv) {
 
                     if (matched) {
                         count++;
-                        sum += doc_id;
-                        if (num_first10 < 10) {
-                            first10[num_first10++] = doc_id;
-                        }
+                        sum += d;
+                        if (num_first10 < 10) first10[num_first10++] = d;
                     }
-
-                    word &= word - 1;
                 }
-            }
 
-            if (count == 0) {
-                std::fputs("0 0\n", out);
-            } else {
-                std::fprintf(out, "%u %llu", count, static_cast<unsigned long long>(sum));
-                for (uint32_t j = 0; j < num_first10; ++j) {
-                    std::fprintf(out, " %u", first10[j]);
+                if (count == 0) {
+                    query_results[qi] = "0 0\n";
+                } else {
+                    std::string res;
+                    res.reserve(64);
+                    append_u64(res, count);
+                    res.push_back(' ');
+                    append_u64(res, sum);
+                    for (uint32_t i = 0; i < num_first10; ++i) {
+                        res.push_back(' ');
+                        append_u64(res, first10[i]);
+                    }
+                    res.push_back('\n');
+                    query_results[qi] = std::move(res);
                 }
-                std::fputc('\n', out);
             }
         }
+    };
+
+    workers.clear();
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        workers.emplace_back(query_worker);
+    }
+    for (auto& w : workers) w.join();
+
+    // 4. Output write
+    int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd >= 0) {
+        for (const auto& line : query_results) {
+            write(out_fd, line.data(), line.length());
+        }
+        close(out_fd);
     }
 
-    std::fclose(out);
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> total_elapsed = end_time - start_time;
-
-    std::cout << "\n=== Track B Complete Pipeline Results ===" << std::endl;
-    std::cout << "Documents:          " << num_docs << std::endl;
-    std::cout << "Query Terms Indexed:" << num_terms << std::endl;
-    std::cout << "Queries Answered:   " << queries.size() << std::endl;
-    std::cout << "Total Elapsed Time: " << total_elapsed.count() << " ms (" 
-              << (total_elapsed.count() / 1000.0) << " s)" << std::endl;
-    std::cout << "Output File:        " << out_path << std::endl;
-
+    munmap((void*)q_data, q_size);
+    munmap((void*)d_data, d_size);
     return 0;
 }

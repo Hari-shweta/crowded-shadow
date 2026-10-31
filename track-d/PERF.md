@@ -5,4 +5,5 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | — | 48.0 | 915 | 0 |
-| 1 | C++ rewrite: mmap I/O, two-pass CSR graph construction without raw edge staging, QuadHeap (4-ary min-heap) with hole-moving sift down, DSU component pruning, and multi-threaded query execution | (pending first board push) | ~0.33 | ~141 | ~60+ |
+| 1 | Baseline C++ rewrite (unidirectional QuadHeap) | cf7fdc8 | 1.688 | 383 | 38.185 |
+| 2 | Memory-lean CSR: 212 KB bitset for in-degrees, head degree extraction, immediate DSU and cursor reclamation, fast ASCII serializer | (pending next push) | ~1.25 | ~150 | ~55+ |

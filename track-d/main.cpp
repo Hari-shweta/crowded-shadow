@@ -41,7 +41,6 @@ public:
     void push(uint64_t dist, uint32_t u) {
         size_t idx = data.size();
         data.push_back({dist, u});
-        // Sift up: tree depth is cut in half compared to binary heap
         while (idx > 0) {
             size_t p = (idx - 1) >> 2;
             if (dist < data[p].dist) {
@@ -86,7 +85,7 @@ public:
     }
 };
 
-// Disjoint Set Union (DSU) to instantly detect disconnected components (e.g. islands, isolated nodes)
+// Disjoint Set Union (DSU) for detecting disconnected components
 struct DSU {
     std::vector<uint32_t> parent;
     DSU(uint32_t n) : parent(n) {
@@ -152,19 +151,21 @@ int main(int argc, char** argv) {
     uint32_t m = parse_u32(p);
     const char* edges_start = p;
 
-    // Pass 1: Degree counts, in-degree counts, and component DSU.
-    // Zero allocation for raw edges saves tens of megabytes of heap!
+    // Use compact 1-bit bitset for has_in_edge (212 KB instead of 7 MB!)
+    size_t in_words = (n + 63) / 64;
+    std::vector<uint64_t> has_in_edge(in_words, 0);
+
+    // Degree stored directly in head[u+1] (eliminates 7 MB degree array!)
+    std::vector<uint32_t> head(n + 1, 0);
     DSU dsu(n);
-    std::vector<uint32_t> degree(n, 0);
-    std::vector<uint32_t> in_deg(n, 0);
 
     for (uint32_t i = 0; i < m; ++i) {
         uint32_t u = parse_u32(p);
         uint32_t v = parse_u32(p);
         uint32_t w = parse_u32(p);
         if (u != v) {
-            degree[u]++;
-            in_deg[v]++;
+            head[u + 1]++;
+            has_in_edge[v >> 6] |= (1ULL << (v & 63));
             dsu.unite(u, v);
         }
     }
@@ -174,16 +175,18 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < n; ++i) {
         comp[i] = dsu.find(i);
     }
+    // Free DSU memory immediately
+    dsu.parent.clear();
+    dsu.parent.shrink_to_fit();
 
-    // Build CSR index
-    std::vector<uint32_t> head(n + 1, 0);
+    // Prefix sum on head
     for (uint32_t u = 0; u < n; ++u) {
-        head[u + 1] = head[u] + degree[u];
+        head[u + 1] += head[u];
     }
+
     std::vector<uint32_t> cur = head;
     std::vector<Edge> edges(head[n]);
 
-    // Pass 2: Populate contiguous CSR edges array directly from mapped file
     p = edges_start;
     for (uint32_t i = 0; i < m; ++i) {
         uint32_t u = parse_u32(p);
@@ -193,6 +196,9 @@ int main(int argc, char** argv) {
             edges[cur[u]++] = {v, w};
         }
     }
+    // Free cur array immediately
+    cur.clear();
+    cur.shrink_to_fit();
     munmap((void*)data, fsize);
 
     // 2. Memory-map queries.txt
@@ -241,12 +247,15 @@ int main(int argc, char** argv) {
             uint32_t s = queries[qi].s;
             uint32_t t = queries[qi].t;
 
-            // O(1) Fast paths
+            // O(1) Fast paths with zero redundant arrays
             if (s == t) {
                 answers[qi] = 0;
                 continue;
             }
-            if (degree[s] == 0 || in_deg[t] == 0 || comp[s] != comp[t]) {
+            // Out-degree check: head[s+1] == head[s]
+            // In-degree check: has_in_edge bitset
+            // Disconnected check: comp[s] != comp[t]
+            if (head[s + 1] == head[s] || !((has_in_edge[t >> 6] >> (t & 63)) & 1ULL) || comp[s] != comp[t]) {
                 answers[qi] = -1;
                 continue;
             }
@@ -269,6 +278,7 @@ int main(int argc, char** argv) {
 
                 uint32_t start_idx = head[u];
                 uint32_t end_idx = head[u + 1];
+
                 for (uint32_t i = start_idx; i < end_idx; ++i) {
                     uint32_t v = edges[i].to;
                     uint64_t nd = d + edges[i].w;
@@ -284,7 +294,7 @@ int main(int argc, char** argv) {
             }
 
             answers[qi] = ans;
-            // Clean up only touched nodes (O(visited) reset, avoids clearing 14 MB per query!)
+            // Clean up only touched nodes (O(visited) reset)
             for (uint32_t x : touched) {
                 dist[x] = UINT64_MAX;
             }
@@ -336,4 +346,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
