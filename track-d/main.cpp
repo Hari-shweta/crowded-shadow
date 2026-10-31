@@ -130,10 +130,8 @@ int main(int argc, char** argv) {
     const char* edges_start = p;
     size_t edges_bytes = (data + fsize) - edges_start;
 
-    unsigned int hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
-    unsigned int build_threads = std::min(hw, 8u);
-
+    // Use 4 threads for build to minimize memory footprint
+    unsigned int build_threads = 4;
     std::vector<const char*> starts(build_threads);
     std::vector<const char*> ends(build_threads);
 
@@ -262,15 +260,18 @@ int main(int argc, char** argv) {
     }
     munmap((void*)data, fsize);
 
-    // 3. Multi-Threaded Bidirectional Dijkstra
-    unsigned int query_threads = std::min(hw, 8u);
+    // 3. Multi-Threaded Bidirectional Dijkstra with L2 Bitset Pruning
+    unsigned int query_threads = 6;
     std::vector<int64_t> answers(queries.size(), -1);
     std::atomic<size_t> query_idx{0};
+    size_t words = (n + 63) / 64;
 
     for (unsigned int t = 0; t < query_threads; ++t) {
         workers.emplace_back([&]() {
             std::vector<uint64_t> f_dist(n, UINT64_MAX);
             std::vector<uint64_t> r_dist(n, UINT64_MAX);
+            std::vector<uint64_t> f_seen(words, 0);
+            std::vector<uint64_t> r_seen(words, 0);
             std::vector<uint32_t> f_touched; f_touched.reserve(16384);
             std::vector<uint32_t> r_touched; r_touched.reserve(16384);
             QuadHeap f_qh, r_qh;
@@ -292,10 +293,12 @@ int main(int argc, char** argv) {
                 }
 
                 f_dist[s] = 0;
+                f_seen[s >> 6] |= (1ULL << (s & 63));
                 f_touched.push_back(s);
                 f_qh.push(0, s);
 
                 r_dist[tgt] = 0;
+                r_seen[tgt >> 6] |= (1ULL << (tgt & 63));
                 r_touched.push_back(tgt);
                 r_qh.push(0, tgt);
 
@@ -307,7 +310,7 @@ int main(int argc, char** argv) {
                     if (f_min + r_min >= best_dist) break;
 
                     if (f_qh.data.size() <= r_qh.data.size()) {
-                        // Forward step
+                        // Forward expansion
                         HeapNode top = f_qh.pop();
                         uint64_t d = top.dist;
                         uint32_t u = top.u;
@@ -320,18 +323,21 @@ int main(int argc, char** argv) {
                             uint64_t nd = d + fedges[i].w;
                             if (f_dist[v] == UINT64_MAX) {
                                 f_dist[v] = nd;
+                                f_seen[v >> 6] |= (1ULL << (v & 63));
                                 f_touched.push_back(v);
                                 f_qh.push(nd, v);
                             } else if (nd < f_dist[v]) {
                                 f_dist[v] = nd;
                                 f_qh.push(nd, v);
                             }
-                            if (r_dist[v] != UINT64_MAX && nd + r_dist[v] < best_dist) {
-                                best_dist = nd + r_dist[v];
+                            if ((r_seen[v >> 6] & (1ULL << (v & 63))) != 0) {
+                                if (nd + r_dist[v] < best_dist) {
+                                    best_dist = nd + r_dist[v];
+                                }
                             }
                         }
                     } else {
-                        // Backward step
+                        // Backward expansion
                         HeapNode top = r_qh.pop();
                         uint64_t d = top.dist;
                         uint32_t u = top.u;
@@ -344,14 +350,17 @@ int main(int argc, char** argv) {
                             uint64_t nd = d + redges[i].w;
                             if (r_dist[v] == UINT64_MAX) {
                                 r_dist[v] = nd;
+                                r_seen[v >> 6] |= (1ULL << (v & 63));
                                 r_touched.push_back(v);
                                 r_qh.push(nd, v);
                             } else if (nd < r_dist[v]) {
                                 r_dist[v] = nd;
                                 r_qh.push(nd, v);
                             }
-                            if (f_dist[v] != UINT64_MAX && nd + f_dist[v] < best_dist) {
-                                best_dist = nd + f_dist[v];
+                            if ((f_seen[v >> 6] & (1ULL << (v & 63))) != 0) {
+                                if (nd + f_dist[v] < best_dist) {
+                                    best_dist = nd + f_dist[v];
+                                }
                             }
                         }
                     }
@@ -359,8 +368,14 @@ int main(int argc, char** argv) {
 
                 answers[qi] = (best_dist == UINT64_MAX) ? -1 : (int64_t)best_dist;
 
-                for (uint32_t x : f_touched) f_dist[x] = UINT64_MAX;
-                for (uint32_t x : r_touched) r_dist[x] = UINT64_MAX;
+                for (uint32_t x : f_touched) {
+                    f_dist[x] = UINT64_MAX;
+                    f_seen[x >> 6] &= ~(1ULL << (x & 63));
+                }
+                for (uint32_t x : r_touched) {
+                    r_dist[x] = UINT64_MAX;
+                    r_seen[x >> 6] &= ~(1ULL << (x & 63));
+                }
                 f_touched.clear();
                 r_touched.clear();
                 f_qh.clear();
