@@ -6,4 +6,4 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | — | 14.44 | 367 | 0 |
 | 1 | Initial C++ baseline: scalar parsing, 10MB direct region table, `std::unordered_set<std::string>` distinct names | `f9a22b0` | 2.567 | 249 | 16.775 |
-| 2 | SIMD quote-balanced boundary partitioning, multi-threaded record parsing, zero-allocation 64-bit name hashing, in-place L2 sort + parallel k-way merge deduplication | pending board run | ~0.025 | ~8 | ~78-80+ |
+| 2 | Parallel regions CSV ingest (lock-free disjoint writes), 64-byte unrolled SIMD quote scanning (AVX2/NEON), zero-allocation 64-bit name hashing, in-place sort + parallel k-way merge, 393 lines | pending board run | ~0.020 | ~8 | ~80+ |
