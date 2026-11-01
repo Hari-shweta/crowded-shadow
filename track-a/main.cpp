@@ -67,40 +67,20 @@ static inline uint32_t hash_endpoint(const char* data, size_t len) {
 #endif
 
 struct SimpleBarrier {
-    std::mutex mtx;
-    std::condition_variable cv;
-    unsigned int count;
-    unsigned int initial;
-    unsigned int gen{0};
+    std::mutex mtx; std::condition_variable cv;
+    unsigned int count, initial, gen{0};
     explicit SimpleBarrier(unsigned int n) : count(n), initial(n) {}
     void wait() {
         std::unique_lock<std::mutex> lock(mtx);
         unsigned int g = gen;
-        if (--count == 0) {
-            gen++;
-            count = initial;
-            cv.notify_all();
-        } else {
-            cv.wait(lock, [this, g] { return gen != g; });
-        }
+        if (--count == 0) { gen++; count = initial; cv.notify_all(); }
+        else { cv.wait(lock, [this, g] { return gen != g; }); }
     }
 };
 
-static constexpr size_t MAX_ENDPOINTS = 2048;
-static constexpr size_t TOTAL_GROUPS = 72 * MAX_ENDPOINTS;
-
-struct StringView {
-    const char* data;
-    uint16_t len;
-};
-
-static constexpr size_t HASH_TABLE_CAPACITY = 8192;
-struct EndpointEntry {
-    StringView str;
-    uint32_t hash = 0;
-    uint16_t id = 0;
-    std::atomic<bool> occupied{false};
-};
+static constexpr size_t MAX_ENDPOINTS = 2048, TOTAL_GROUPS = 72 * MAX_ENDPOINTS, HASH_TABLE_CAPACITY = 8192;
+struct StringView { const char* data; uint16_t len; };
+struct EndpointEntry { StringView str; uint32_t hash = 0; uint16_t id = 0; std::atomic<bool> occupied{false}; };
 
 class ConcurrentEndpointDictionary {
 public:
@@ -361,12 +341,17 @@ int main(int argc, char** argv) {
     }
     for (auto& w : workers) w.join();
 
-    // 4. Output write with 1 MB buffered stream
-    FILE* out = fopen(output_path.c_str(), "w");
-    if (out) {
-        std::vector<char> write_buf(1024 * 1024);
-        setvbuf(out, write_buf.data(), _IOFBF, write_buf.size());
-
+    // 4. Output write with 1 MB batched buffered stream
+    int out_fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out_fd >= 0) {
+        std::vector<char> io_buf(1024 * 1024); size_t io_pos = 0; char line_buf[256];
+        auto write_u64 = [](char* p, uint64_t v) -> char* {
+            if (v == 0) { *p++ = '0'; return p; }
+            char tmp[24]; int pos = 0;
+            while (v > 0) { tmp[pos++] = '0' + (v % 10); v /= 10; }
+            for (int i = pos - 1; i >= 0; --i) *p++ = tmp[i];
+            return p;
+        };
         for (int hour_id = 0; hour_id < 72; ++hour_id) {
             const char* hour_str = HOUR_STRINGS[hour_id];
             for (uint16_t ep_id : sorted_endpoint_ids) {
@@ -377,14 +362,25 @@ int main(int argc, char** argv) {
                 const auto& ep = dict.endpoints[ep_id];
                 uint32_t errs = group_errors[g_idx].load(std::memory_order_relaxed);
                 uint64_t ppm = (static_cast<uint64_t>(errs) * 1000000ULL) / cnt;
-
                 const auto& p = group_p[g_idx];
-                std::fprintf(out, "%s %.*s %u %u %u %u %u %llu\n",
-                             hour_str, (int)ep.len, ep.data,
-                             cnt, p.p50, p.p95, p.p99, errs, (unsigned long long)ppm);
+
+                char* ptr = line_buf;
+                memcpy(ptr, hour_str, 20); ptr += 20; *ptr++ = ' ';
+                memcpy(ptr, ep.data, ep.len); ptr += ep.len; *ptr++ = ' ';
+                ptr = write_u64(ptr, cnt); *ptr++ = ' ';
+                ptr = write_u64(ptr, p.p50); *ptr++ = ' ';
+                ptr = write_u64(ptr, p.p95); *ptr++ = ' ';
+                ptr = write_u64(ptr, p.p99); *ptr++ = ' ';
+                ptr = write_u64(ptr, errs); *ptr++ = ' ';
+                ptr = write_u64(ptr, ppm); *ptr++ = '\n';
+                size_t len = ptr - line_buf;
+
+                if (io_pos + len > io_buf.size()) { write(out_fd, io_buf.data(), io_pos); io_pos = 0; }
+                memcpy(io_buf.data() + io_pos, line_buf, len); io_pos += len;
             }
         }
-        fclose(out);
+        if (io_pos > 0) write(out_fd, io_buf.data(), io_pos);
+        close(out_fd);
     }
     return 0;
 }
